@@ -4,8 +4,7 @@ Universidad de los Andes
 
 Integrantes:
   - Jacobo Zarruk Estrada       (202223913)
-  - Jerónimo Vásquez Ponce      (202223824)
-  - Kevin Arenas                (202110673)
+  - 
 
 
 REQUISITOS
