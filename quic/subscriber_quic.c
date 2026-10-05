@@ -1,3 +1,15 @@
+/*
+ * subscriber_quic.c — Subscriber (versión QUIC, bono)
+ *
+ * 1. Handshake: envía SUBSCRIBE:<temas> y reintenta hasta recibir ACK:SUBSCRIBE.
+ * 2. Recibe DATA:<seq>:<tema>:<mensaje> y responde siempre ACK:DATA:<seq>.
+ * 3. Entrega en orden: si llega un seq mayor al esperado lo guarda en un
+ *    buffer de reordenamiento; si llega uno ya entregado (duplicado por
+ *    retransmisión) lo descarta. Así la aplicación ve los mensajes
+ *    completos, sin duplicados y en orden, como en un stream de QUIC.
+ *
+ * Se puede seguir uno o varios partidos: PartidoA  o  PartidoA,PartidoB
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,13 +17,21 @@
 #include <arpa/inet.h>
 
 #define PORT_BROKER  9004
-#define BUF_SIZE     800
+#define BUF_SIZE     1024
 #define BROKER_IP    "127.0.0.1"
+#define WINDOW       64        /* tamaño del buffer de reordenamiento */
+#define SUB_RETRIES  5
+
+typedef struct {
+    int  valid;
+    int  seq;
+    char texto[BUF_SIZE];
+} Slot;
+
+static Slot reorder[WINDOW];
 
 int main() {
-    /* socket(): crea un socket UDP (SOCK_DGRAM) en el dominio IPv4 (AF_INET).
-       QUIC opera sobre UDP añadiendo confiabilidad a nivel de aplicación.
-       Retorna un descriptor de archivo o -1 si hubo error. */
+    /* socket(): crea un socket UDP (SOCK_DGRAM) en IPv4 (AF_INET). */
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) { perror("socket"); exit(1); }
 
@@ -21,9 +41,8 @@ int main() {
     };
     inet_pton(AF_INET, BROKER_IP, &broker_addr.sin_addr);
 
-    /* bind(): asocia el socket a un puerto local para poder
-       recibir datagramas enviados por el broker. Sin bind(),
-       el broker no sabría a qué puerto enviar los mensajes. */
+    /* bind(): fija un puerto local (elegido por el SO con puerto 0) para que
+       el broker siempre conteste a la misma dirección durante la sesión. */
     struct sockaddr_in local_addr = {
         .sin_family      = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
@@ -34,80 +53,102 @@ int main() {
         exit(1);
     }
 
-    char topic[64];
-    printf("[SUBSCRIBER QUIC] Ingresa el tema al que deseas suscribirte (ej: PartidoA): ");
-    scanf("%63s", topic);
+    char topics[256];
+    printf("[SUBSCRIBER QUIC] Tema(s) a seguir, separados por coma (ej: PartidoA,PartidoB): ");
+    if (scanf("%255s", topics) != 1) exit(1);
     getchar();
 
     char buffer[BUF_SIZE];
-    snprintf(buffer, BUF_SIZE, "SUBSCRIBE:%s", topic);
+    snprintf(buffer, BUF_SIZE, "SUBSCRIBE:%s", topics);
 
-    /* sendto(): envía el mensaje de suscripción al broker.
-       El broker responderá con un ACK confirmando el registro,
-       simulando el mecanismo de confiabilidad de QUIC sobre UDP. */
-    if (sendto(sock, buffer, strlen(buffer), 0,
-               (struct sockaddr *)&broker_addr,
-               sizeof(broker_addr)) < 0) {
-        perror("sendto");
-        exit(1);
+    /* setsockopt(SO_RCVTIMEO): durante el handshake se espera 1 s el ACK. */
+    struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int conectado = 0;
+    for (int intento = 1; intento <= SUB_RETRIES && !conectado; intento++) {
+        /* sendto(): envía la solicitud de suscripción (inicio de la conexión). */
+        sendto(sock, buffer, strlen(buffer), 0,
+               (struct sockaddr *)&broker_addr, sizeof(broker_addr));
+        printf("[SUBSCRIBER QUIC] SUBSCRIBE enviado (intento %d)\n", intento);
+
+        char resp[BUF_SIZE];
+        /* recvfrom(): espera el ACK:SUBSCRIBE o vence el timeout. */
+        int n = recvfrom(sock, resp, BUF_SIZE - 1, 0, NULL, NULL);
+        if (n > 0) {
+            resp[n] = '\0';
+            if (strcmp(resp, "ACK:SUBSCRIBE") == 0) conectado = 1;
+        }
+    }
+    if (!conectado) {
+        printf("[SUBSCRIBER QUIC] El broker no respondió. ¿Está corriendo?\n");
+        close(sock);
+        return 1;
     }
 
-    struct sockaddr_in from_addr;
-    socklen_t addr_len = sizeof(from_addr);
+    /* Ya conectado: recvfrom() vuelve a ser bloqueante (sin timeout). */
+    tv.tv_sec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    memset(buffer, 0, BUF_SIZE);
+    printf("[SUBSCRIBER QUIC] Conexión establecida. Siguiendo '%s'. Esperando mensajes...\n",
+           topics);
 
-    /* recvfrom(): espera el ACK del broker confirmando la suscripción.
-       Esto simula el establecimiento de sesión de QUIC, garantizando
-       que el broker registró al suscriptor antes de recibir mensajes. */
-    int bytes = recvfrom(sock, buffer, BUF_SIZE - 1, 0,
-                         (struct sockaddr *)&from_addr, &addr_len);
-    if (bytes > 0 && strncmp(buffer, "ACK:SUBSCRIBE", 13) == 0) {
-        printf("[SUBSCRIBER QUIC] Suscripción confirmada por el broker\n");
-    }
-
-    printf("[SUBSCRIBER QUIC] Suscrito al tema '%s'. Esperando mensajes...\n", topic);
-
-    int ultimo_seq = 0;
+    int esperado = 1;   /* próximo seq que se debe entregar a la aplicación */
 
     while (1) {
-        memset(buffer, 0, BUF_SIZE);
+        struct sockaddr_in from;
+        socklen_t len = sizeof(from);
 
-        /* recvfrom(): recibe mensajes del broker con número de secuencia.
-           El número de secuencia permite detectar pérdidas y mensajes
-           desordenados, simulando el control de flujo de QUIC sobre UDP.
-           Retorna bytes recibidos o -1 si hubo error. */
-        bytes = recvfrom(sock, buffer, BUF_SIZE - 1, 0,
-                         (struct sockaddr *)&from_addr, &addr_len);
-        if (bytes < 0) {
-            perror("recvfrom");
-            break;
+        /* recvfrom(): recibe un datagrama del broker. */
+        int n = recvfrom(sock, buffer, BUF_SIZE - 1, 0, (struct sockaddr *)&from, &len);
+        if (n < 0) { perror("recvfrom"); break; }
+        buffer[n] = '\0';
+
+        if (strncmp(buffer, "DATA:", 5) != 0) continue;   /* p. ej. ACK:SUBSCRIBE tardío */
+
+        char *p = strchr(buffer + 5, ':');
+        if (!p) continue;
+        int seq = atoi(buffer + 5);
+        char *texto = p + 1;               /* "<tema>:<mensaje>", con espacios */
+
+        /* Se confirma SIEMPRE, incluso duplicados: si el ACK anterior se
+           perdió, el broker necesita otro para dejar de retransmitir. */
+        char ack[64];
+        snprintf(ack, sizeof(ack), "ACK:DATA:%d", seq);
+        /* sendto(): envía el ACK al broker. */
+        sendto(sock, ack, strlen(ack), 0, (struct sockaddr *)&from, len);
+
+        if (seq < esperado) {
+            printf("[SUBSCRIBER QUIC] DATA:%d duplicado (retransmisión), descartado\n", seq);
+            continue;
+        }
+        if (seq >= esperado + WINDOW) {
+            printf("[SUBSCRIBER QUIC] DATA:%d fuera de la ventana, descartado\n", seq);
+            continue;
         }
 
-        int seq = 0;
-        char contenido[BUF_SIZE];
+        Slot *s = &reorder[seq % WINDOW];
+        if (!s->valid) {
+            s->valid = 1;
+            s->seq   = seq;
+            strncpy(s->texto, texto, BUF_SIZE - 1);
+            s->texto[BUF_SIZE - 1] = '\0';
+        }
+        if (seq > esperado)
+            printf("[SUBSCRIBER QUIC] DATA:%d llegó antes que DATA:%d, se guarda en buffer\n",
+                   seq, esperado);
 
-        if (sscanf(buffer, "SEQ:%d:%799s", &seq, contenido) == 2) {
-            if (seq != ultimo_seq + 1) {
-                printf("[SUBSCRIBER QUIC] ADVERTENCIA: mensaje fuera de orden. "
-                       "Esperaba SEQ:%d, llegó SEQ:%d\n", ultimo_seq + 1, seq);
-            }
-            ultimo_seq = seq;
-            printf("[SUBSCRIBER QUIC] SEQ:%d | Mensaje: %s\n", seq, contenido);
-
-            /* sendto(): envía ACK al broker confirmando la recepción
-               del mensaje. Esto simula el mecanismo de confirmación
-               de entrega de QUIC a nivel de aplicación. */
-            char ack[BUF_SIZE];
-            snprintf(ack, BUF_SIZE, "ACK:%d", seq);
-            sendto(sock, ack, strlen(ack), 0,
-                   (struct sockaddr *)&from_addr, addr_len);
-        } else {
-            printf("[SUBSCRIBER QUIC] Mensaje recibido: %s\n", buffer);
+        /* Entrega en orden todo lo que ya esté disponible */
+        while (reorder[esperado % WINDOW].valid &&
+               reorder[esperado % WINDOW].seq == esperado) {
+            Slot *e = &reorder[esperado % WINDOW];
+            printf("[SUBSCRIBER QUIC] #%d | %s\n", e->seq, e->texto);
+            e->valid = 0;
+            esperado++;
         }
     }
 
-    /* close(): cierra el socket y libera el descriptor de archivo. */
+    /* close(): cierra el socket. */
     close(sock);
     return 0;
 }
