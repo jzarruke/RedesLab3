@@ -1,3 +1,9 @@
+/*
+ * subscriber_tcp.c — Subscriber (versión TCP)
+ * Se suscribe a uno o varios temas ("PartidoA" o "PartidoA,PartidoB") y
+ * muestra cada mensaje recibido. Como TCP es un flujo de bytes, los datos
+ * recibidos se acumulan y se separan por '\n' para mostrar mensajes completos.
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +15,7 @@
 #define BROKER_IP   "127.0.0.1"
 
 int main() {
-    /* socket(): crea un socket TCP (SOCK_STREAM) en el dominio IPv4 (AF_INET).
+    /* socket(): crea un socket TCP (SOCK_STREAM) en IPv4 (AF_INET).
        Retorna un descriptor de archivo o -1 si hubo error. */
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); exit(1); }
@@ -20,8 +26,8 @@ int main() {
     };
     inet_pton(AF_INET, BROKER_IP, &broker_addr.sin_addr);
 
-    /* connect(): establece la conexión TCP con el broker en la IP
-       y puerto definidos. Retorna 0 si exitoso o -1 si hubo error. */
+    /* connect(): establece la conexión TCP con el broker.
+       Retorna 0 si exitoso o -1 si hubo error. */
     if (connect(sock, (struct sockaddr *)&broker_addr, sizeof(broker_addr)) < 0) {
         perror("connect");
         exit(1);
@@ -29,37 +35,45 @@ int main() {
 
     printf("[SUBSCRIBER] Conectado al broker\n");
 
-    char topic[64];
-    printf("[SUBSCRIBER] Ingresa el tema al que deseas suscribirte (ej: PartidoA): ");
-    scanf("%63s", topic);
+    char topics[256];
+    printf("[SUBSCRIBER] Tema(s) a seguir, separados por coma (ej: PartidoA,PartidoB): ");
+    if (scanf("%255s", topics) != 1) exit(1);
     getchar();
 
     char buffer[BUF_SIZE];
-    snprintf(buffer, BUF_SIZE, "SUBSCRIBE:%s", topic);
+    int len = snprintf(buffer, BUF_SIZE, "SUBSCRIBE:%s\n", topics);
 
-    /* send(): envía el mensaje de suscripción al broker indicando
-       el tema de interés. Retorna bytes enviados o -1 si hubo error. */
-    if (send(sock, buffer, strlen(buffer), 0) < 0) {
+    /* send(): envía la suscripción indicando los temas de interés. */
+    if (send(sock, buffer, len, 0) < 0) {
         perror("send");
         exit(1);
     }
 
-    printf("[SUBSCRIBER] Suscrito al tema '%s'. Esperando mensajes...\n", topic);
+    printf("[SUBSCRIBER] Suscrito a '%s'. Esperando mensajes...\n", topics);
 
+    int acumulado = 0;
     while (1) {
-        memset(buffer, 0, BUF_SIZE);
-
-        /* recv(): recibe mensajes enviados por el broker.
-           Bloquea hasta recibir datos. Retorna bytes recibidos,
-           0 si se cerró la conexión, o -1 si hubo error. */
-        int bytes = recv(sock, buffer, BUF_SIZE - 1, 0);
-
+        /* recv(): recibe bytes del broker. Puede traer un mensaje parcial o
+           varios mensajes juntos. Retorna 0 si el broker cerró la conexión. */
+        int bytes = recv(sock, buffer + acumulado, BUF_SIZE - 1 - acumulado, 0);
         if (bytes <= 0) {
             printf("[SUBSCRIBER] Broker desconectado\n");
             break;
         }
+        acumulado += bytes;
+        buffer[acumulado] = '\0';
 
-        printf("[SUBSCRIBER] Mensaje recibido: %s\n", buffer);
+        /* Imprime cada mensaje completo (terminado en '\n') */
+        char *inicio = buffer, *nl;
+        while ((nl = strchr(inicio, '\n')) != NULL) {
+            *nl = '\0';
+            printf("[SUBSCRIBER] Mensaje recibido: %s\n", inicio);
+            inicio = nl + 1;
+        }
+        /* Lo que quede es un mensaje incompleto: se mueve al inicio */
+        acumulado = strlen(inicio);
+        memmove(buffer, inicio, acumulado);
+        if (acumulado == BUF_SIZE - 1) acumulado = 0;   /* línea demasiado larga */
     }
 
     /* close(): cierra el socket y libera el descriptor de archivo. */
