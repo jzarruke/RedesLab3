@@ -22,11 +22,11 @@ int main() {
     };
     inet_pton(AF_INET, BROKER_IP, &broker_addr.sin_addr);
 
-    printf("[PUBLISHER UDP] Conectado al broker\n");
+    printf("[PUBLISHER UDP] Listo (UDP no establece conexión)\n");
 
     char topic[64];
     printf("[PUBLISHER UDP] Ingresa el tema del partido (ej: PartidoA): ");
-    scanf("%63s", topic);
+    if (scanf("%63s", topic) != 1) exit(1);
     getchar();
 
     char mensaje[MSG_SIZE];
@@ -36,17 +36,19 @@ int main() {
 
     while (1) {
         printf("> ");
-        fgets(mensaje, MSG_SIZE, stdin);
+        fflush(stdout);
+        if (fgets(mensaje, MSG_SIZE, stdin) == NULL) break;   /* EOF */
         mensaje[strcspn(mensaje, "\n")] = '\0';
 
         if (strcmp(mensaje, "salir") == 0) break;
+        if (strlen(mensaje) == 0) continue;
 
-        snprintf(buffer, BUF_SIZE, "%s:%s", topic, mensaje);
+        int len = snprintf(buffer, BUF_SIZE, "%s:%s", topic, mensaje);
 
         /* sendto(): envía el datagrama UDP al broker sin establecer
            conexión previa. Cada llamada es independiente y no garantiza
            entrega ni orden. Retorna bytes enviados o -1 si hubo error. */
-        if (sendto(sock, buffer, strlen(buffer), 0,
+        if (sendto(sock, buffer, len, 0,
                    (struct sockaddr *)&broker_addr,
                    sizeof(broker_addr)) < 0) {
             perror("sendto");
