@@ -4,7 +4,8 @@ Universidad de los Andes
 
 Integrantes:
   - Jacobo Zarruk Estrada       (202223913)
-  - 
+  - Paula Carreño 
+  - Martin Chicaiza Mendivelso (202420350)
 
 
 ============================================================
