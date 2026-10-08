@@ -43,7 +43,7 @@ externas.
 2. REQUISITOS
 ============================================================
 
-- Sistema operativo: Linux (probado en Ubuntu 22.04 vía WSL)
+- Sistema operativo: Linux (probado en Ubuntu 26.04 via VMware
 - Compilador: gcc
 - Librería: pthread (solo para broker_tcp; incluida en Linux)
 
